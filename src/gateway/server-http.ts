@@ -563,6 +563,7 @@ export function createGatewayHttpServer(opts: {
         sendGatewayAuthFailure(res, { ok: false, reason: "unauthorized" });
         return;
       }
+
       if (scopedCanvas.rewrittenUrl) {
         req.url = scopedCanvas.rewrittenUrl;
       }

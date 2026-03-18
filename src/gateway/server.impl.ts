@@ -570,6 +570,7 @@ export async function startGatewayServer(
   };
   const nodeSendToSession = (sessionKey: string, event: string, payload: unknown) =>
     nodeSubscriptions.sendToSession(sessionKey, event, payload, nodeSendEvent);
+
   const nodeSendToAllSubscribed = (event: string, payload: unknown) =>
     nodeSubscriptions.sendToAllSubscribed(event, payload, nodeSendEvent);
   const nodeSubscribe = nodeSubscriptions.subscribe;
@@ -822,6 +823,7 @@ export async function startGatewayServer(
       broadcastVoiceWakeChanged,
     },
   });
+
   logGatewayStartup({
     cfg: cfgAtStart,
     bindHost,
@@ -851,7 +853,6 @@ export async function startGatewayServer(
         controlUiBasePath,
         logTailscale,
       });
-
   let browserControl: Awaited<ReturnType<typeof startBrowserControlServerIfEnabled>> = null;
   if (!minimalTestGateway) {
     ({ browserControl, pluginServices } = await startGatewaySidecars({

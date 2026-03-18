@@ -334,6 +334,7 @@ export function registerSubCliCommands(program: Command, argv: string[] = proces
     }
     return;
   }
+
   const primary = getPrimaryCommand(argv);
   if (primary && shouldRegisterPrimaryOnly(argv)) {
     const entry = entries.find((candidate) => candidate.name === primary);

@@ -178,9 +178,25 @@ type RunPreparedReplyParams = {
   abortedLastRun: boolean;
 };
 
+/**
+ * AI 回复执行的准备与调度函数。
+ * 负责构建完整的上下文（群组信息、系统提示、媒体附件等），处理队列/中断逻辑，并启动 agent 运行。
+ *
+ * 主要阶段：
+ * 1. 参数解构与初始化
+ * 2. 打字模式与群组上下文配置
+ * 3. 消息体构建（空消息处理、会话重置、系统事件）
+ * 4. 思考级别解析与验证
+ * 5. 队列/中断/跟进模式处理
+ * 6. 运行参数组装
+ * 7. 调用 runReplyAgent 执行回复
+ */
 export async function runPreparedReply(
   params: RunPreparedReplyParams,
 ): Promise<ReplyPayload | ReplyPayload[] | undefined> {
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 1: 参数解构与初始化
+  // ─────────────────────────────────────────────────────────────────────────────
   const {
     ctx,
     sessionCtx,
@@ -230,6 +246,12 @@ export async function runPreparedReply(
   } = params;
   let currentSystemSent = systemSent;
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 2: 打字模式与群组上下文配置
+  // - 解析打字策略（是否显示"正在输入..."）
+  // - 构建群组聊天上下文（群名、参与者、回复指引）
+  // - 构建群组行为介绍（激活模式、潜水模式等）
+  // ─────────────────────────────────────────────────────────────────────────────
   const isFirstTurnInSession = isNewSession || !currentSystemSent;
   const isGroupChat = sessionCtx.ChatType === "group";
   const wasMentioned = ctx.WasMentioned === true;
@@ -273,6 +295,13 @@ export async function runPreparedReply(
     groupIntro,
     groupSystemPrompt,
   ].filter(Boolean);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 3: 消息体构建
+  // - 处理空消息、裸重置命令（/new, /reset）
+  // - 应用会话提示（session hints）
+  // - 注入系统事件、线程上下文、媒体附件备注
+  // ─────────────────────────────────────────────────────────────────────────────
   const baseBody = sessionCtx.BodyStripped ?? sessionCtx.Body ?? "";
   // Use CommandBody/RawBody for bare reset detection (clean message without structural context).
   const rawBodyTrimmed = (ctx.CommandBody ?? ctx.RawBody ?? ctx.Body ?? "").trim();
@@ -332,6 +361,14 @@ export async function runPreparedReply(
   });
   const isGroupSession = sessionEntry?.chatType === "group" || sessionEntry?.chatType === "channel";
   const isMainSession = !isGroupSession && sessionKey === normalizeMainKey(sessionCfg?.mainKey);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 4: 思考级别解析与验证
+  // - 从消息首词提取思考级别（low/medium/high/xhigh）
+  // - 验证 xhigh 是否被当前模型支持
+  // - 排空系统事件并注入消息体
+  // - 确保技能快照
+  // ─────────────────────────────────────────────────────────────────────────────
   // Extract first-token think hint from the user body BEFORE prepending system events.
   // If done after, the System: prefix becomes parts[0] and silently shadows any
   // low|medium|high shorthand the user typed.
@@ -435,6 +472,13 @@ export async function runPreparedReply(
   const queuedBody = mediaNote
     ? [mediaNote, mediaReplyHint, queueBodyBase].filter(Boolean).join("\n").trim()
     : queueBodyBase;
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 5: 队列/中断/跟进模式处理
+  // - 解析队列设置（interrupt/steer/followup/collect 模式）
+  // - interrupt 模式：清空队列并中止当前运行
+  // - steer/followup 模式：将消息加入队列或引导现有运行
+  // ─────────────────────────────────────────────────────────────────────────────
   const resolvedQueue = resolveQueueSettings({
     cfg,
     channel: sessionCtx.Provider,
@@ -468,6 +512,12 @@ export async function runPreparedReply(
     isNewSession,
   });
   const authProfileIdSource = sessionEntry?.authProfileOverrideSource;
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 6: 运行参数组装
+  // - 构建 followupRun 配置对象（包含所有 agent 运行所需参数）
+  // - 包括：会话信息、模型配置、思考级别、权限、超时等
+  // ─────────────────────────────────────────────────────────────────────────────
   const followupRun = {
     prompt: queuedBody,
     messageId: sessionCtx.MessageSidFull ?? sessionCtx.MessageSid,
@@ -526,6 +576,11 @@ export async function runPreparedReply(
     },
   };
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 7: 执行 Agent 回复
+  // - 调用 runReplyAgent 启动 AI 回复生成
+  // - 传递所有配置：队列设置、打字模式、流式分块等
+  // ─────────────────────────────────────────────────────────────────────────────
   return runReplyAgent({
     commandBody: prefixedCommandBody,
     followupRun,

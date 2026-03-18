@@ -59,6 +59,20 @@ import type { TypingController } from "./typing.js";
 
 const BLOCK_REPLY_SEND_TIMEOUT_MS = 15_000;
 
+/**
+ * AI 回复生成的核心执行函数。
+ * 负责实际运行 agent、处理队列逻辑、管理回退状态、收集使用量统计。
+ *
+ * 主要阶段：
+ * 1. 参数初始化与打字信号配置
+ * 2. 分块回复管道配置
+ * 3. 队列/引导模式处理（steer/followup/drop）
+ * 4. 内存刷新（如果需要）
+ * 5. 执行 agent 轮次（含回退逻辑）
+ * 6. 处理分块回复、工具任务、回退状态
+ * 7. 使用量统计和诊断事件
+ * 8. 最终化回复并处理后续队列
+ */
 export async function runReplyAgent(params: {
   commandBody: string;
   followupRun: FollowupRun;
@@ -117,6 +131,12 @@ export async function runReplyAgent(params: {
     typingMode,
   } = params;
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 1: 参数初始化与打字信号配置
+  // - 初始化会话状态变量
+  // - 创建打字信号器（控制"正在输入..."显示）
+  // - 配置工具结果/输出的发送回调
+  // ─────────────────────────────────────────────────────────────────────────────
   let activeSessionEntry = sessionEntry;
   const activeSessionStore = sessionStore;
   let activeIsNewSession = isNewSession;
@@ -142,6 +162,11 @@ export async function runReplyAgent(params: {
   const pendingToolTasks = new Set<Promise<void>>();
   const blockReplyTimeoutMs = opts?.blockReplyTimeoutMs ?? BLOCK_REPLY_SEND_TIMEOUT_MS;
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 2: 分块回复管道配置
+  // - 解析回复路由（replyToChannel、replyToMode）
+  // - 创建分块回复管道（用于流式回复分段发送）
+  // ─────────────────────────────────────────────────────────────────────────────
   const replyToChannel = resolveOriginMessageProvider({
     originatingChannel: sessionCtx.OriginatingChannel,
     provider: sessionCtx.Surface ?? sessionCtx.Provider,
@@ -188,6 +213,12 @@ export async function runReplyAgent(params: {
     }
   };
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 3: 队列/引导模式处理
+  // - steer 模式：向正在流式输出的运行注入新消息
+  // - drop 模式：丢弃当前消息
+  // - enqueue-followup 模式：将消息加入后续队列
+  // ─────────────────────────────────────────────────────────────────────────────
   if (shouldSteer && isStreaming) {
     const steered = queueEmbeddedPiMessage(followupRun.run.sessionId, followupRun.prompt);
     if (steered && !shouldFollowup) {
@@ -218,6 +249,12 @@ export async function runReplyAgent(params: {
 
   await typingSignals.signalRunStart();
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 4: 内存刷新（如果需要）
+  // - 检查上下文 token 是否接近限制
+  // - 如需要则执行内存压缩/刷新
+  // - 创建后续轮次运行器
+  // ─────────────────────────────────────────────────────────────────────────────
   activeSessionEntry = await runMemoryFlushIfNeeded({
     cfg,
     followupRun,
@@ -247,6 +284,12 @@ export async function runReplyAgent(params: {
   });
 
   let responseUsageLine: string | undefined;
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 5: 会话重置逻辑
+  // - 定义会话重置函数（用于压缩失败、角色冲突等场景）
+  // - 重置时生成新 sessionId、清理旧转录文件
+  // ─────────────────────────────────────────────────────────────────────────────
   type SessionResetOptions = {
     failureLabel: string;
     buildLogMessage: (nextSessionId: string) => string;
@@ -332,6 +375,13 @@ export async function runReplyAgent(params: {
         `Role ordering conflict (${reason}). Restarting session ${sessionKey} -> ${nextSessionId}.`,
       cleanupTranscripts: true,
     });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 6: 执行 Agent 轮次（含回退逻辑）
+  // - 调用 runAgentTurnWithFallback 执行实际的 AI 推理
+  // - 处理模型回退（主模型失败时切换到备用模型）
+  // - 收集运行结果和元数据
+  // ─────────────────────────────────────────────────────────────────────────────
   try {
     const runStartedAt = Date.now();
     const runOutcome = await runAgentTurnWithFallback({
@@ -372,6 +422,12 @@ export async function runReplyAgent(params: {
     } = runOutcome;
     let { didLogHeartbeatStrip, autoCompactionCompleted } = runOutcome;
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // 阶段 7: 处理运行结果
+    // - 更新群组激活状态
+    // - 刷新分块回复管道、等待工具任务完成
+    // - 处理回退状态（切换/恢复通知）
+    // ─────────────────────────────────────────────────────────────────────────────
     if (
       shouldInjectGroupIntro &&
       activeSessionEntry &&
@@ -455,6 +511,12 @@ export async function runReplyAgent(params: {
       activeSessionEntry?.contextTokens ??
       DEFAULT_CONTEXT_TOKENS;
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // 阶段 8: 使用量统计与持久化
+    // - 持久化 session 使用量（token 消耗、模型信息）
+    // - 构建回复 payload 数组
+    // - 处理提醒任务守卫（检测未调度的提醒承诺）
+    // ─────────────────────────────────────────────────────────────────────────────
     await persistRunSessionUsage({
       storePath,
       sessionKey,
@@ -526,6 +588,11 @@ export async function runReplyAgent(params: {
 
     await signalTypingIfNeeded(guardedReplyPayloads, typingSignals);
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // 阶段 9: 诊断事件与使用量格式化
+    // - 发送诊断事件（token 使用、成本估算、运行时长）
+    // - 格式化响应使用量行（可选显示给用户）
+    // ─────────────────────────────────────────────────────────────────────────────
     if (isDiagnosticsEnabled(cfg) && hasNonzeroUsage(usage)) {
       const input = usage.input ?? 0;
       const output = usage.output ?? 0;
@@ -592,6 +659,12 @@ export async function runReplyAgent(params: {
     }
 
     // If verbose is enabled, prepend operational run notices.
+    // ─────────────────────────────────────────────────────────────────────────────
+    // 阶段 10: 组装最终回复与后续队列处理
+    // - 添加 verbose 通知（新会话、回退、压缩完成等）
+    // - 追加使用量行
+    // - 调用 finalizeWithFollowup 返回回复并触发后续队列
+    // ─────────────────────────────────────────────────────────────────────────────
     let finalPayloads = guardedReplyPayloads;
     const verboseNotices: ReplyPayload[] = [];
 

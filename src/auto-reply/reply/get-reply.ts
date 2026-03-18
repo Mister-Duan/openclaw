@@ -53,11 +53,21 @@ function mergeSkillFilters(channelFilter?: string[], agentFilter?: string[]): st
   return channel.filter((name) => agentSet.has(name));
 }
 
+/**
+ * 自动回复系统的核心入口函数，负责处理收到的消息并生成 AI 回复。
+ * 主要阶段：配置解析 → 消息预处理 → 会话状态初始化 → 指令解析 → 内联动作处理 → AI 回复生成
+ */
 export async function getReplyFromConfig(
   ctx: MsgContext,
   opts?: GetReplyOptions,
   configOverride?: OpenClawConfig,
 ): Promise<ReplyPayload | ReplyPayload[] | undefined> {
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 1: 初始化与配置解析
+  // - 加载配置、解析 agent ID 和会话 key
+  // - 合并技能过滤器（channel + agent 级别）
+  // - 解析默认模型；若是心跳消息则使用心跳专用模型
+  // ─────────────────────────────────────────────────────────────────────────────
   const isFastTestEnv = process.env.OPENCLAW_TEST_FAST === "1";
   const cfg = configOverride ?? loadConfig();
   const targetSessionKey =
@@ -101,6 +111,12 @@ export async function getReplyFromConfig(
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 2: 工作区与超时设置
+  // - 确保 agent 工作区目录存在，创建引导文件
+  // - 解析 agent 目录和超时时间
+  // - 创建打字状态控制器（模拟"正在输入..."）
+  // ─────────────────────────────────────────────────────────────────────────────
   const workspaceDirRaw = resolveAgentWorkspaceDir(cfg, agentId) ?? DEFAULT_AGENT_WORKSPACE_DIR;
   const workspace = await ensureAgentWorkspace({
     dir: workspaceDirRaw,
@@ -122,6 +138,13 @@ export async function getReplyFromConfig(
   });
   opts?.onTypingController?.(typing);
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 3: 消息预处理
+  // - 最终化入站上下文
+  // - 应用媒体理解（图片/视频分析）
+  // - 应用链接理解（URL 内容提取）
+  // - 触发消息预处理钩子
+  // ─────────────────────────────────────────────────────────────────────────────
   const finalized = finalizeInboundContext(ctx);
 
   if (!isFastTestEnv) {
@@ -142,6 +165,12 @@ export async function getReplyFromConfig(
     isFastTestEnv,
   });
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 4: 会话状态初始化
+  // - 解析命令授权
+  // - 初始化会话状态（加载历史、检测重置、解析分组）
+  // - 应用重置时的模型覆盖
+  // ─────────────────────────────────────────────────────────────────────────────
   const commandAuthorized = finalized.CommandAuthorized;
   resolveCommandAuthorization({
     ctx: finalized,
@@ -187,6 +216,11 @@ export async function getReplyFromConfig(
     aliasIndex,
   });
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 5: 模型覆盖解析
+  // - 解析 channel 级别的模型覆盖
+  // - 若无心跳/会话级覆盖，应用 channel 模型
+  // ─────────────────────────────────────────────────────────────────────────────
   const channelModelOverride = resolveChannelModelOverride({
     cfg,
     channel:
@@ -217,6 +251,11 @@ export async function getReplyFromConfig(
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 6: 指令解析
+  // - 解析命令、指令、思考级别等
+  // - 若指令直接返回回复则提前退出
+  // ─────────────────────────────────────────────────────────────────────────────
   const directiveResult = await resolveReplyDirectives({
     ctx: finalized,
     cfg,
@@ -279,6 +318,12 @@ export async function getReplyFromConfig(
   provider = resolvedProvider;
   model = resolvedModel;
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 7: 内联动作处理
+  // - 处理 /reset、/new 等重置命令钩子
+  // - 处理内联命令/技能
+  // - 若内联动作有回复则返回
+  // ─────────────────────────────────────────────────────────────────────────────
   const maybeEmitMissingResetHooks = async () => {
     if (!resetTriggered || !command.isAuthorizedSender || command.resetHookTriggered) {
       return;
@@ -346,6 +391,10 @@ export async function getReplyFromConfig(
   directives = inlineActionResult.directives;
   abortedLastRun = inlineActionResult.abortedLastRun ?? abortedLastRun;
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 8: 沙箱媒体暂存
+  // - 将媒体文件暂存到沙箱工作区供 agent 访问
+  // ─────────────────────────────────────────────────────────────────────────────
   await stageSandboxMedia({
     ctx,
     sessionCtx,
@@ -354,6 +403,10 @@ export async function getReplyFromConfig(
     workspaceDir,
   });
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 阶段 9: 执行 AI 回复
+  // - 调用 runPreparedReply 运行 AI 模型生成最终回复
+  // ─────────────────────────────────────────────────────────────────────────────
   return runPreparedReply({
     ctx,
     sessionCtx,

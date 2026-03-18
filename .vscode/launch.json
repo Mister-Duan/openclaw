@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Gateway Watch (Debug)",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scripts/watch-node.mjs", "gateway", "--force"],
+      "env": {
+        "OPENCLAW_SKIP_CHANNELS": "1",
+        "CLAWDBOT_SKIP_CHANNELS": "1",
+        "OPENCLAW_WATCH_MODE": "1"
+      },
+      "sourceMaps": true,
+      "resolveSourceMapLocations": ["${workspaceFolder}/**", "!**/node_modules/**"],
+      "skipFiles": ["<node_internals>/**"],
+      "console": "integratedTerminal"
+    }
+  ]
+}

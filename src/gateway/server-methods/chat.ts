@@ -727,7 +727,30 @@ export const chatHandlers: GatewayRequestHandlers = {
       runIds: res.aborted ? [runId] : [],
     });
   },
+  /**
+   * chat.send - 处理来自客户端的聊天消息
+   *
+   * 此函数是 Webchat/UI 客户端发送消息到 Agent 的核心入口。
+   *
+   * 主要流程:
+   * 1. 参数验证与消息清理 - 校验输入参数，清除非法字符
+   * 2. 停止命令处理 - 如果是 stop 命令，中止当前会话的所有运行
+   * 3. 幂等性/去重检查 - 避免重复处理相同的消息
+   * 4. 附件解析 - 解析消息中的图片等附件
+   * 5. 会话路由解析 - 确定消息应该路由到哪个渠道
+   * 6. 消息分发 - 将消息分发给 Agent 处理
+   * 7. 结果广播 - 将 Agent 的回复广播给所有订阅的客户端
+   *
+   * @param params.sessionKey - 会话标识符（如 "main", "direct:user123"）
+   * @param params.message - 用户发送的消息内容
+   * @param params.thinking - 可选的思考级别参数（low/medium/high）
+   * @param params.deliver - 是否将回复投递到外部渠道（WhatsApp/Telegram 等）
+   * @param params.attachments - 可选的附件数组（图片等）
+   * @param params.timeoutMs - 可选的超时时间（毫秒）
+   * @param params.idempotencyKey - 幂等性键，用于去重和追踪
+   */
   "chat.send": async ({ params, respond, context, client }) => {
+    // ==================== 1. 参数验证 ====================
     if (!validateChatSendParams(params)) {
       respond(
         false,
@@ -739,20 +762,24 @@ export const chatHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+    // 将参数转换为强类型结构
     const p = params as {
-      sessionKey: string;
-      message: string;
-      thinking?: string;
-      deliver?: boolean;
+      sessionKey: string; // 会话标识符
+      message: string; // 消息内容
+      thinking?: string; // 思考级别 (low/medium/high)
+      deliver?: boolean; // 是否投递到外部渠道
       attachments?: Array<{
+        // 附件列表
         type?: string;
         mimeType?: string;
         fileName?: string;
         content?: unknown;
       }>;
-      timeoutMs?: number;
-      idempotencyKey: string;
+      timeoutMs?: number; // 超时时间
+      idempotencyKey: string; // 幂等性键（用于去重）
     };
+    // ==================== 2. 消息清理与规范化 ====================
+    // 清理消息中的非法控制字符（如 NULL 字节）
     const sanitizedMessageResult = sanitizeChatSendMessageInput(p.message);
     if (!sanitizedMessageResult.ok) {
       respond(
@@ -763,9 +790,12 @@ export const chatHandlers: GatewayRequestHandlers = {
       return;
     }
     const inboundMessage = sanitizedMessageResult.message;
+    // 检查是否为停止命令（如 /stop）
     const stopCommand = isChatStopCommandText(inboundMessage);
+    // 规范化附件格式（将 RPC 附件转换为内部格式）
     const normalizedAttachments = normalizeRpcAttachmentsToChatAttachments(p.attachments);
     const rawMessage = inboundMessage.trim();
+    // 消息或附件至少需要一个
     if (!rawMessage && normalizedAttachments.length === 0) {
       respond(
         false,
@@ -774,12 +804,14 @@ export const chatHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+    // ==================== 3. 附件解析 ====================
+    // 如果有附件，解析并提取图片内容（限制最大 5MB）
     let parsedMessage = inboundMessage;
     let parsedImages: ChatImageContent[] = [];
     if (normalizedAttachments.length > 0) {
       try {
         const parsed = await parseMessageWithAttachments(inboundMessage, normalizedAttachments, {
-          maxBytes: 5_000_000,
+          maxBytes: 5_000_000, // 5MB 限制
           log: context.logGateway,
         });
         parsedMessage = parsed.message;
@@ -789,15 +821,21 @@ export const chatHandlers: GatewayRequestHandlers = {
         return;
       }
     }
+    // ==================== 4. 会话加载与配置 ====================
     const rawSessionKey = p.sessionKey;
+    // 加载会话条目：包含配置、会话状态、规范化的会话键
     const { cfg, entry, canonicalKey: sessionKey } = loadSessionEntry(rawSessionKey);
+    // 解析 Agent 超时时间（可被参数覆盖）
     const timeoutMs = resolveAgentTimeoutMs({
       cfg,
       overrideMs: p.timeoutMs,
     });
     const now = Date.now();
+    // 使用幂等性键作为运行 ID（用于追踪和去重）
     const clientRunId = p.idempotencyKey;
 
+    // ==================== 5. 发送策略检查 ====================
+    // 根据配置检查是否允许在此会话中发送消息
     const sendPolicy = resolveSendPolicy({
       cfg,
       entry,
@@ -814,6 +852,8 @@ export const chatHandlers: GatewayRequestHandlers = {
       return;
     }
 
+    // ==================== 6. 停止命令处理 ====================
+    // 如果是停止命令，中止当前会话的所有活跃运行
     if (stopCommand) {
       const res = abortChatRunsForSessionKeyWithPartials({
         context,
@@ -826,6 +866,8 @@ export const chatHandlers: GatewayRequestHandlers = {
       return;
     }
 
+    // ==================== 7. 幂等性/去重检查 ====================
+    // 检查是否已处理过相同的请求（已缓存结果）
     const cached = context.dedupe.get(`chat:${clientRunId}`);
     if (cached) {
       respond(cached.ok, cached.payload, cached.error, {
@@ -834,6 +876,7 @@ export const chatHandlers: GatewayRequestHandlers = {
       return;
     }
 
+    // 检查是否有相同 runId 的请求正在运行中
     const activeExisting = context.chatAbortControllers.get(clientRunId);
     if (activeExisting) {
       respond(true, { runId: clientRunId, status: "in_flight" as const }, undefined, {
@@ -843,8 +886,11 @@ export const chatHandlers: GatewayRequestHandlers = {
       return;
     }
 
+    // ==================== 8. 创建运行实例并注册 ====================
     try {
+      // 创建 AbortController 用于支持取消操作
       const abortController = new AbortController();
+      // 注册到活跃运行追踪器（用于超时和手动中止）
       context.chatAbortControllers.set(clientRunId, {
         controller: abortController,
         sessionId: entry?.sessionId ?? clientRunId,
@@ -852,19 +898,25 @@ export const chatHandlers: GatewayRequestHandlers = {
         startedAtMs: now,
         expiresAtMs: resolveChatRunExpiresAtMs({ now, timeoutMs }),
       });
+      // 立即响应客户端，确认请求已接收
       const ackPayload = {
         runId: clientRunId,
         status: "started" as const,
       };
       respond(true, ackPayload, undefined, { runId: clientRunId });
 
+      // ==================== 9. 消息预处理 ====================
       const trimmedMessage = parsedMessage.trim();
+      // 如果指定了 thinking 参数且不是命令，注入 /think 前缀
       const injectThinking = Boolean(
         p.thinking && trimmedMessage && !trimmedMessage.startsWith("/"),
       );
       const commandBody = injectThinking ? `/think ${p.thinking} ${parsedMessage}` : parsedMessage;
       const clientInfo = client?.connect?.client;
+      // 是否需要将回复投递到外部渠道（WhatsApp/Telegram 等）
       const shouldDeliverExternally = p.deliver === true;
+      // ==================== 10. 路由解析 ====================
+      // 从会话条目中获取投递路由信息（渠道、目标、账户、线程）
       const routeChannelCandidate = normalizeMessageChannel(
         entry?.deliveryContext?.channel ?? entry?.lastChannel,
       );
@@ -872,6 +924,7 @@ export const chatHandlers: GatewayRequestHandlers = {
       const routeAccountIdCandidate =
         entry?.deliveryContext?.accountId ?? entry?.lastAccountId ?? undefined;
       const routeThreadIdCandidate = entry?.deliveryContext?.threadId ?? entry?.lastThreadId;
+      // 解析会话键以确定会话范围类型
       const parsedSessionKey = parseAgentSessionKey(sessionKey);
       const sessionScopeParts = (parsedSessionKey?.rest ?? sessionKey).split(":").filter(Boolean);
       const sessionScopeHead = sessionScopeParts[0];
@@ -880,6 +933,9 @@ export const chatHandlers: GatewayRequestHandlers = {
       const sessionPeerShapeCandidates = [sessionScopeParts[1], sessionScopeParts[2]]
         .map((part) => (part ?? "").trim().toLowerCase())
         .filter(Boolean);
+      // 判断会话范围类型：
+      // - 渠道无关范围（main, direct, dm 等）不自动继承外部路由
+      // - 渠道相关范围（telegram:xxx, whatsapp:xxx）可继承路由
       const isChannelAgnosticSessionScope = CHANNEL_AGNOSTIC_SESSION_SCOPES.has(
         normalizedSessionScopeHead,
       );
@@ -891,14 +947,14 @@ export const chatHandlers: GatewayRequestHandlers = {
         typeof sessionScopeParts[1] === "string" &&
         sessionChannelHint === routeChannelCandidate;
       const clientMode = client?.connect?.client?.mode;
+      // 判断请求是否来自 Webchat/UI 客户端
       const isFromWebchatClient =
         isWebchatClient(client?.connect?.client) || clientMode === GATEWAY_CLIENT_MODES.UI;
       const configuredMainKey = (cfg.session?.mainKey ?? "main").trim().toLowerCase();
       const isConfiguredMainSessionScope =
         normalizedSessionScopeHead.length > 0 && normalizedSessionScopeHead === configuredMainKey;
-      // Channel-agnostic session scopes (main, direct:<peer>, etc.) can leak
-      // stale routes across surfaces. Allow configured main sessions from
-      // non-Webchat/UI clients (e.g., CLI, backend) to keep the last external route.
+      // 渠道无关的会话范围（main, direct:<peer> 等）可能跨表面泄漏过时路由。
+      // 允许来自非 Webchat/UI 客户端（如 CLI、后端）的配置主会话保留最后的外部路由。
       const canInheritDeliverableRoute = Boolean(
         sessionChannelHint &&
         sessionChannelHint !== INTERNAL_MESSAGE_CHANNEL &&
@@ -906,6 +962,7 @@ export const chatHandlers: GatewayRequestHandlers = {
           (isChannelScopedSession || hasLegacyChannelPeerShape)) ||
           (isConfiguredMainSessionScope && client?.connect !== undefined && !isFromWebchatClient)),
       );
+      // 最终判断是否有有效的外部投递路由
       const hasDeliverableRoute =
         shouldDeliverExternally &&
         canInheritDeliverableRoute &&
@@ -913,49 +970,57 @@ export const chatHandlers: GatewayRequestHandlers = {
         routeChannelCandidate !== INTERNAL_MESSAGE_CHANNEL &&
         typeof routeToCandidate === "string" &&
         routeToCandidate.trim().length > 0;
+      // 确定消息来源渠道和目标
       const originatingChannel = hasDeliverableRoute
         ? routeChannelCandidate
         : INTERNAL_MESSAGE_CHANNEL;
       const originatingTo = hasDeliverableRoute ? routeToCandidate : undefined;
       const accountId = hasDeliverableRoute ? routeAccountIdCandidate : undefined;
       const messageThreadId = hasDeliverableRoute ? routeThreadIdCandidate : undefined;
-      // Inject timestamp so agents know the current date/time.
-      // Only BodyForAgent gets the timestamp — Body stays raw for UI display.
-      // See: https://github.com/moltbot/moltbot/issues/3658
+      // 注入时间戳，让 Agent 知道当前日期/时间。
+      // 只有 BodyForAgent 获取时间戳 — Body 保持原始用于 UI 显示。
+      // 参见: https://github.com/moltbot/moltbot/issues/3658
       const stampedMessage = injectTimestamp(parsedMessage, timestampOptsFromConfig(cfg));
 
+      // ==================== 11. 构建消息上下文 ====================
+      // MsgContext 包含消息路由和处理所需的所有上下文信息
       const ctx: MsgContext = {
-        Body: parsedMessage,
-        BodyForAgent: stampedMessage,
-        BodyForCommands: commandBody,
-        RawBody: parsedMessage,
-        CommandBody: commandBody,
-        SessionKey: sessionKey,
-        Provider: INTERNAL_MESSAGE_CHANNEL,
-        Surface: INTERNAL_MESSAGE_CHANNEL,
-        OriginatingChannel: originatingChannel,
-        OriginatingTo: originatingTo,
-        AccountId: accountId,
-        MessageThreadId: messageThreadId,
-        ChatType: "direct",
-        CommandAuthorized: true,
-        MessageSid: clientRunId,
-        SenderId: clientInfo?.id,
-        SenderName: clientInfo?.displayName,
-        SenderUsername: clientInfo?.displayName,
-        GatewayClientScopes: client?.connect?.scopes,
+        Body: parsedMessage, // 原始消息体（用于 UI 显示）
+        BodyForAgent: stampedMessage, // 带时间戳的消息体（用于 Agent）
+        BodyForCommands: commandBody, // 命令体（可能包含 /think 前缀）
+        RawBody: parsedMessage, // 原始未处理的消息
+        CommandBody: commandBody, // 命令体
+        SessionKey: sessionKey, // 会话键
+        Provider: INTERNAL_MESSAGE_CHANNEL, // 消息提供者（internal）
+        Surface: INTERNAL_MESSAGE_CHANNEL, // 消息表面（internal）
+        OriginatingChannel: originatingChannel, // 原始渠道
+        OriginatingTo: originatingTo, // 目标地址
+        AccountId: accountId, // 账户 ID
+        MessageThreadId: messageThreadId, // 线程 ID
+        ChatType: "direct", // 聊天类型
+        CommandAuthorized: true, // 命令已授权
+        MessageSid: clientRunId, // 消息 ID
+        SenderId: clientInfo?.id, // 发送者 ID
+        SenderName: clientInfo?.displayName, // 发送者名称
+        SenderUsername: clientInfo?.displayName, // 发送者用户名
+        GatewayClientScopes: client?.connect?.scopes, // 客户端权限范围
       };
 
+      // ==================== 12. Agent 和回复分发器设置 ====================
+      // 解析会话对应的 Agent ID
       const agentId = resolveSessionAgentId({
         sessionKey,
         config: cfg,
       });
+      // 创建回复前缀选项（用于格式化 Agent 回复）
       const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
         cfg,
         agentId,
         channel: INTERNAL_MESSAGE_CHANNEL,
       });
+      // 收集最终回复的各部分
       const finalReplyParts: string[] = [];
+      // 创建回复分发器：处理 Agent 的回复并分发给客户端
       const dispatcher = createReplyDispatcher({
         ...prefixOptions,
         onError: (err) => {
@@ -973,7 +1038,9 @@ export const chatHandlers: GatewayRequestHandlers = {
         },
       });
 
+      // ==================== 13. 消息分发与处理 ====================
       let agentRunStarted = false;
+      // 异步分发入站消息给 Agent 处理
       void dispatchInboundMessage({
         ctx,
         cfg,
@@ -982,8 +1049,10 @@ export const chatHandlers: GatewayRequestHandlers = {
           runId: clientRunId,
           abortSignal: abortController.signal,
           images: parsedImages.length > 0 ? parsedImages : undefined,
+          // Agent 运行开始时的回调
           onAgentRunStart: (runId) => {
             agentRunStarted = true;
+            // 注册工具事件接收者（如果客户端支持）
             const connId = typeof client?.connId === "string" ? client.connId : undefined;
             const wantsToolEvents = hasGatewayClientCap(
               client?.connect?.caps,
@@ -991,9 +1060,9 @@ export const chatHandlers: GatewayRequestHandlers = {
             );
             if (connId && wantsToolEvents) {
               context.registerToolEventRecipient(runId, connId);
-              // Register for any other active runs *in the same session* so
-              // late-joining clients (e.g. page refresh mid-response) receive
-              // in-progress tool events without leaking cross-session data.
+              // 为同一会话中的其他活跃运行也注册，这样后加入的客户端
+              // （如页面刷新后重连）可以接收正在进行的工具事件，
+              // 同时不会泄漏跨会话数据。
               for (const [activeRunId, active] of context.chatAbortControllers) {
                 if (activeRunId !== runId && active.sessionKey === p.sessionKey) {
                   context.registerToolEventRecipient(activeRunId, connId);
@@ -1004,8 +1073,11 @@ export const chatHandlers: GatewayRequestHandlers = {
           onModelSelected,
         },
       })
+        // ==================== 14. 处理完成后的回调 ====================
         .then(() => {
+          // 如果 Agent 运行没有启动（可能是命令处理或静默回复）
           if (!agentRunStarted) {
+            // 合并所有回复部分
             const combinedReply = finalReplyParts
               .map((part) => part.trim())
               .filter(Boolean)
@@ -1013,6 +1085,7 @@ export const chatHandlers: GatewayRequestHandlers = {
               .trim();
             let message: Record<string, unknown> | undefined;
             if (combinedReply) {
+              // 将回复追加到会话记录中
               const { storePath: latestStorePath, entry: latestEntry } =
                 loadSessionEntry(sessionKey);
               const sessionId = latestEntry?.sessionId ?? entry?.sessionId ?? clientRunId;
@@ -1042,6 +1115,7 @@ export const chatHandlers: GatewayRequestHandlers = {
                 };
               }
             }
+            // 广播最终回复给所有订阅的客户端
             broadcastChatFinal({
               context,
               runId: clientRunId,
@@ -1049,6 +1123,7 @@ export const chatHandlers: GatewayRequestHandlers = {
               message,
             });
           }
+          // 缓存成功结果用于幂等性检查
           setGatewayDedupeEntry({
             dedupe: context.dedupe,
             key: `chat:${clientRunId}`,
@@ -1059,8 +1134,10 @@ export const chatHandlers: GatewayRequestHandlers = {
             },
           });
         })
+        // ==================== 15. 错误处理 ====================
         .catch((err) => {
           const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));
+          // 缓存错误结果用于幂等性检查
           setGatewayDedupeEntry({
             dedupe: context.dedupe,
             key: `chat:${clientRunId}`,
@@ -1075,6 +1152,7 @@ export const chatHandlers: GatewayRequestHandlers = {
               error,
             },
           });
+          // 广播错误给所有订阅的客户端
           broadcastChatError({
             context,
             runId: clientRunId,
@@ -1082,16 +1160,21 @@ export const chatHandlers: GatewayRequestHandlers = {
             errorMessage: String(err),
           });
         })
+        // ==================== 16. 清理 ====================
         .finally(() => {
+          // 从活跃运行追踪器中移除
           context.chatAbortControllers.delete(clientRunId);
         });
+      // ==================== 17. 外层异常处理 ====================
     } catch (err) {
+      // 处理同步代码中抛出的异常
       const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));
       const payload = {
         runId: clientRunId,
         status: "error" as const,
         summary: String(err),
       };
+      // 缓存错误结果
       setGatewayDedupeEntry({
         dedupe: context.dedupe,
         key: `chat:${clientRunId}`,
@@ -1102,6 +1185,7 @@ export const chatHandlers: GatewayRequestHandlers = {
           error,
         },
       });
+      // 响应客户端错误
       respond(false, payload, error, {
         runId: clientRunId,
         error: formatForLog(err),

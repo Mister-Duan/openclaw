@@ -57,12 +57,14 @@ export default defineConfig([
     env,
     fixedExtension: false,
     platform: "node",
+    sourcemap: true, // 添加这一行
   },
   {
     entry: "src/entry.ts",
     env,
     fixedExtension: false,
     platform: "node",
+    sourcemap: true,
   },
   {
     // Ensure this module is bundled as an entry so legacy CLI shims can resolve its exports.
@@ -70,12 +72,14 @@ export default defineConfig([
     env,
     fixedExtension: false,
     platform: "node",
+    sourcemap: true,
   },
   {
     entry: "src/infra/warning-filter.ts",
     env,
     fixedExtension: false,
     platform: "node",
+    sourcemap: true,
   },
   {
     // Keep sync lazy-runtime channel modules as concrete dist files.
